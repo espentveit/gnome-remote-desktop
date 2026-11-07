@@ -22,6 +22,13 @@
 
 #include "config.h"
 
+#ifdef HAVE_FREERDP_UDP
+#include <freerdp/server/udp.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include "grd-daemon-system.h"
 
 #include <gio/gunixfdlist.h>
@@ -56,6 +63,13 @@ typedef struct
 
   GrdSession *session;
   GSocketConnection *socket_connection;
+#ifdef HAVE_FREERDP_UDP
+  char *local_address;
+  uint16_t local_port;
+  /* Cookie hash identifying this client's UDP relay in the daemon's listener. */
+  uint8_t relay_hash[32];
+  gboolean has_relay;
+#endif
 
   HandoverInterface *handover_src;
   HandoverInterface *handover_dst;
@@ -83,6 +97,11 @@ struct _GrdDaemonSystem
   unsigned int gdm_watch_name_id;
 
   GHashTable *remote_clients;
+
+#ifdef HAVE_FREERDP_UDP
+  freerdp_udp_listener *udp_listener;
+  GHashTable *udp_addresses;
+#endif
 };
 
 G_DEFINE_TYPE (GrdDaemonSystem, grd_daemon_system, GRD_TYPE_DAEMON)
@@ -160,6 +179,162 @@ grd_daemon_system_is_ready (GrdDaemon *daemon)
   return TRUE;
 }
 
+#ifdef HAVE_FREERDP_UDP
+/* The client sends datagrams to the address it reached via TCP and only accepts
+ * responses from that address. */
+static void
+remember_local_address (GrdRemoteClient *remote_client)
+{
+  g_autoptr (GSocketAddress) socket_address = NULL;
+  GInetSocketAddress *inet_socket_address;
+  g_autofree char *address = NULL;
+
+  socket_address =
+    g_socket_connection_get_local_address (remote_client->socket_connection,
+                                           NULL);
+  if (!G_IS_INET_SOCKET_ADDRESS (socket_address))
+    return;
+
+  inet_socket_address = G_INET_SOCKET_ADDRESS (socket_address);
+  address = g_inet_address_to_string (
+              g_inet_socket_address_get_address (inet_socket_address));
+
+  g_free (remote_client->local_address);
+  remote_client->local_address =
+    g_strdup (g_str_has_prefix (address, "::ffff:") ? address + strlen ("::ffff:")
+                                                    : address);
+  remote_client->local_port =
+    g_inet_socket_address_get_port (inet_socket_address);
+}
+
+static gboolean
+ensure_udp_socket (GrdDaemonSystem *daemon_system,
+                   const char      *address,
+                   uint16_t         port)
+{
+  g_autofree char *key = g_strdup_printf ("[%s]:%u", address, port);
+
+  if (!daemon_system->udp_listener)
+    {
+      daemon_system->udp_listener = freerdp_udp_listener_new ();
+      if (!daemon_system->udp_listener ||
+          !freerdp_udp_listener_start (daemon_system->udp_listener))
+        {
+          g_clear_pointer (&daemon_system->udp_listener,
+                           freerdp_udp_listener_free);
+          return FALSE;
+        }
+      daemon_system->udp_addresses =
+        g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+    }
+
+  if (g_hash_table_contains (daemon_system->udp_addresses, key))
+    return TRUE;
+
+  if (!freerdp_udp_listener_open (daemon_system->udp_listener, address, port))
+    return FALSE;
+
+  g_hash_table_add (daemon_system->udp_addresses, g_steal_pointer (&key));
+  return TRUE;
+}
+
+static gboolean
+is_relay_socket (int fd)
+{
+  int type = 0;
+  int domain = 0;
+  socklen_t length = sizeof (type);
+
+  if (getsockopt (fd, SOL_SOCKET, SO_TYPE, &type, &length) != 0)
+    return FALSE;
+
+  length = sizeof (domain);
+  if (getsockopt (fd, SOL_SOCKET, SO_DOMAIN, &domain, &length) != 0)
+    return FALSE;
+
+  return type == SOCK_SEQPACKET && domain == AF_UNIX;
+}
+
+static gboolean
+on_handle_relay_udp (GrdDBusRemoteDesktopRdpHandover *interface,
+                     GDBusMethodInvocation           *invocation,
+                     GUnixFDList                     *fd_list,
+                     GVariant                        *cookie_hash,
+                     GVariant                        *fd_variant,
+                     GrdRemoteClient                 *remote_client)
+{
+  GrdDaemonSystem *daemon_system = remote_client->daemon_system;
+  g_autoptr (GError) error = NULL;
+  const uint8_t *hash;
+  size_t hash_length = 0;
+  int fd_idx;
+  int fd;
+
+  hash = g_variant_get_fixed_array (cookie_hash, &hash_length, sizeof (uint8_t));
+  if (hash_length != 32 || !fd_list || !remote_client->local_address)
+    {
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
+                                             G_DBUS_ERROR_INVALID_ARGS,
+                                             "No client to relay");
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
+    }
+
+  /* The caller is a user process. GLib does not validate negative indices, which could
+   * result in the daemon accessing its own file descriptors. */
+  fd_idx = g_variant_get_handle (fd_variant);
+  if (fd_idx < 0 || fd_idx >= g_unix_fd_list_get_length (fd_list))
+    {
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
+                                             G_DBUS_ERROR_INVALID_ARGS,
+                                             "Invalid file descriptor index");
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
+    }
+
+  fd = g_unix_fd_list_get (fd_list, fd_idx, &error);
+  if (fd == -1)
+    {
+      g_dbus_method_invocation_return_gerror (invocation, error);
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
+    }
+
+  if (!is_relay_socket (fd))
+    {
+      close (fd);
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
+                                             G_DBUS_ERROR_INVALID_ARGS,
+                                             "Not a socket pair of the expected type");
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
+    }
+
+  if (!ensure_udp_socket (daemon_system, remote_client->local_address,
+                          remote_client->local_port) ||
+      !freerdp_udp_listener_add_relay (daemon_system->udp_listener, hash, fd))
+    {
+      close (fd);
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
+                                             G_DBUS_ERROR_FAILED,
+                                             "Cannot relay RDP-UDP");
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
+    }
+
+  /* The caller is a user process. Limiting to one relay per client prevents it from
+   * holding too many sockets of this daemon. A new relay replaces the old one. */
+  if (remote_client->has_relay &&
+      memcmp (remote_client->relay_hash, hash,
+              sizeof (remote_client->relay_hash)) != 0)
+    {
+      freerdp_udp_listener_remove_relay (daemon_system->udp_listener,
+                                      remote_client->relay_hash);
+    }
+  memcpy (remote_client->relay_hash, hash, sizeof (remote_client->relay_hash));
+  remote_client->has_relay = TRUE;
+
+  grd_dbus_remote_desktop_rdp_handover_complete_relay_udp (interface, invocation,
+                                                           NULL);
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
+}
+#endif
+
 static gboolean
 on_handle_take_client (GrdDBusRemoteDesktopRdpHandover *interface,
                        GDBusMethodInvocation           *invocation,
@@ -176,6 +351,19 @@ on_handle_take_client (GrdDBusRemoteDesktopRdpHandover *interface,
 
   g_debug ("[DaemonSystem] At: %s, received TakeClient call",
            remote_client->handover_dst->object_path);
+
+  /* The caller is a user process and may invoke this method at any time. */
+  if (!remote_client->socket_connection)
+    {
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
+                                             G_DBUS_ERROR_FAILED,
+                                             "No client to take");
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
+    }
+
+#ifdef HAVE_FREERDP_UDP
+  remember_local_address (remote_client);
+#endif
 
   socket = g_socket_connection_get_socket (remote_client->socket_connection);
   fd = g_socket_get_fd (socket);
@@ -516,6 +704,10 @@ handover_iface_new (const char      *session_id,
                     G_CALLBACK (on_handle_take_client), remote_client);
   g_signal_connect (handover->interface, "handle-get-system-credentials",
                     G_CALLBACK (on_handle_get_system_credentials), remote_client);
+#ifdef HAVE_FREERDP_UDP
+  g_signal_connect (handover->interface, "handle-relay-udp",
+                    G_CALLBACK (on_handle_relay_udp), remote_client);
+#endif
 
   grd_dbus_remote_desktop_rdp_handover_set_handover_is_waiting (
     handover->interface, remote_client->needs_handover);
@@ -570,6 +762,15 @@ unregister_handover_iface (GrdRemoteClient   *remote_client,
 static void
 grd_remote_client_free (GrdRemoteClient *remote_client)
 {
+#ifdef HAVE_FREERDP_UDP
+  /* The daemon may have already freed the listener if it is stopping. */
+  if (remote_client->has_relay && remote_client->daemon_system->udp_listener)
+    {
+      freerdp_udp_listener_remove_relay (remote_client->daemon_system->udp_listener,
+                                      remote_client->relay_hash);
+    }
+  g_free (remote_client->local_address);
+#endif
   disconnect_from_remote_display (remote_client);
 
   g_clear_pointer (&remote_client->id, g_free);
@@ -1005,6 +1206,11 @@ steal_handover_from_client (GrdRemoteClient *new_remote_client,
   g_signal_handlers_disconnect_by_func (handover->interface,
                                         G_CALLBACK (on_handle_get_system_credentials),
                                         old_remote_client);
+#ifdef HAVE_FREERDP_UDP
+  g_signal_handlers_disconnect_by_func (handover->interface,
+                                        G_CALLBACK (on_handle_relay_udp),
+                                        old_remote_client);
+#endif
 
   g_signal_connect (handover->interface, "g-authorize-method",
                     G_CALLBACK (on_authorize_handover_method),
@@ -1018,6 +1224,11 @@ steal_handover_from_client (GrdRemoteClient *new_remote_client,
   g_signal_connect (handover->interface, "handle-get-system-credentials",
                     G_CALLBACK (on_handle_get_system_credentials),
                     new_remote_client);
+#ifdef HAVE_FREERDP_UDP
+  g_signal_connect (handover->interface, "handle-relay-udp",
+                    G_CALLBACK (on_handle_relay_udp),
+                    new_remote_client);
+#endif
 
   g_clear_pointer (&new_remote_client->handover_src, handover_iface_free);
   new_remote_client->handover_src = new_remote_client->handover_dst;
@@ -1501,6 +1712,11 @@ static void
 grd_daemon_system_shutdown (GApplication *app)
 {
   GrdDaemonSystem *daemon_system = GRD_DAEMON_SYSTEM (app);
+
+#ifdef HAVE_FREERDP_UDP
+  g_clear_pointer (&daemon_system->udp_listener, freerdp_udp_listener_free);
+  g_clear_pointer (&daemon_system->udp_addresses, g_hash_table_unref);
+#endif
 
   g_clear_pointer (&daemon_system->remote_clients, g_hash_table_unref);
 

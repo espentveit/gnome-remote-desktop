@@ -19,6 +19,10 @@
 
 #include "config.h"
 
+#ifdef HAVE_FREERDP_UDP
+#include <freerdp/server/udp.h>
+#endif
+
 #include "grd-rdp-dvc-graphics-pipeline.h"
 
 #include <cairo/cairo.h>
@@ -106,6 +110,9 @@ struct _GrdRdpDvcGraphicsPipeline
 
   GHashTable *serial_surface_table;
   gboolean frame_acks_suspended;
+#ifdef HAVE_FREERDP_UDP
+  gboolean paused_for_tunnel;
+#endif
 
   GQueue *encoded_frames;
   uint32_t total_frames_encoded;
@@ -778,6 +785,56 @@ reduce_tracked_frame_infos (GrdRdpDvcGraphicsPipeline *graphics_pipeline,
     }
 }
 
+#ifdef HAVE_FREERDP_UDP
+/* If the client suspends frame acknowledgements, the encoder lacks pacing, which could
+ * overwhelm a link with capacity lower than the production rate.
+ * Called with gfx_mutex held, similar to the resume operation triggered when the
+ * tunnel reports available room. */
+static void
+pause_while_write_blocked (GrdRdpDvcGraphicsPipeline *graphics_pipeline,
+                           GrdRdpGfxSurface          *gfx_surface)
+{
+  RdpgfxServerContext *rdpgfx_context = graphics_pipeline->rdpgfx_context;
+  FreeRDP_UdpSendState send_state = { .size = sizeof (send_state) };
+  GrdRdpSurface *rdp_surface;
+
+  if (!freerdp_peer_get_udp_send_state (rdpgfx_context->rdpcontext->peer,
+                                        &send_state) ||
+      !send_state.writeBlocked)
+    return;
+
+  rdp_surface = grd_rdp_gfx_surface_get_rdp_surface (gfx_surface);
+  grd_rdp_surface_renderer_update_total_frame_slots (
+    grd_rdp_surface_get_surface_renderer (rdp_surface), 0);
+  graphics_pipeline->paused_for_tunnel = TRUE;
+}
+
+static void
+resume_surface (gpointer key,
+                gpointer value,
+                gpointer user_data)
+{
+  GrdRdpGfxSurface *gfx_surface = value;
+  GrdRdpSurface *rdp_surface = grd_rdp_gfx_surface_get_rdp_surface (gfx_surface);
+
+  grd_rdp_surface_renderer_update_total_frame_slots (
+    grd_rdp_surface_get_surface_renderer (rdp_surface), UINT32_MAX);
+}
+
+void
+grd_rdp_dvc_graphics_pipeline_notify_write_unblocked (GrdRdpDvcGraphicsPipeline *graphics_pipeline)
+{
+  g_mutex_lock (&graphics_pipeline->gfx_mutex);
+  if (graphics_pipeline->paused_for_tunnel)
+    {
+      graphics_pipeline->paused_for_tunnel = FALSE;
+      g_hash_table_foreach (graphics_pipeline->surface_table, resume_surface,
+                            NULL);
+    }
+  g_mutex_unlock (&graphics_pipeline->gfx_mutex);
+}
+#endif
+
 static void
 enqueue_tracked_frame_info (GrdRdpDvcGraphicsPipeline *graphics_pipeline,
                             uint32_t                   surface_serial,
@@ -1009,6 +1066,9 @@ grd_rdp_dvc_graphics_pipeline_submit_frame (GrdRdpDvcGraphicsPipeline *graphics_
       enqueue_tracked_frame_info (graphics_pipeline, surface_serial,
                                   cmd_start.frameId, n_subframes,
                                   enc_ack_time_us);
+#ifdef HAVE_FREERDP_UDP
+      pause_while_write_blocked (graphics_pipeline, gfx_surface);
+#endif
     }
   g_mutex_unlock (&graphics_pipeline->gfx_mutex);
 
@@ -1171,6 +1231,9 @@ refresh_gfx_surface_avc420 (GrdRdpDvcGraphicsPipeline *graphics_pipeline,
                                               enc_ack_time_us);
       enqueue_tracked_frame_info (graphics_pipeline, surface_serial,
                                   cmd_start.frameId, 1, enc_ack_time_us);
+#ifdef HAVE_FREERDP_UDP
+      pause_while_write_blocked (graphics_pipeline, gfx_surface);
+#endif
     }
   g_mutex_unlock (&graphics_pipeline->gfx_mutex);
 
@@ -1457,6 +1520,9 @@ refresh_gfx_surface_rfx_progressive (GrdRdpDvcGraphicsPipeline *graphics_pipelin
                                               enc_ack_time_us);
       enqueue_tracked_frame_info (graphics_pipeline, surface_serial,
                                   cmd_start.frameId, 1, enc_ack_time_us);
+#ifdef HAVE_FREERDP_UDP
+      pause_while_write_blocked (graphics_pipeline, gfx_surface);
+#endif
     }
   g_mutex_unlock (&graphics_pipeline->gfx_mutex);
 

@@ -59,6 +59,8 @@ void grd_rdp_dvc_graphics_pipeline_reset_graphics (GrdRdpDvcGraphicsPipeline *gr
                                                    MONITOR_DEF               *monitors,
                                                    uint32_t                   n_monitors);
 
+void grd_rdp_dvc_graphics_pipeline_notify_write_unblocked (GrdRdpDvcGraphicsPipeline *graphics_pipeline);
+
 void grd_rdp_dvc_graphics_pipeline_notify_new_round_trip_time (GrdRdpDvcGraphicsPipeline *graphics_pipeline,
                                                                uint64_t                   round_trip_time_us);
 

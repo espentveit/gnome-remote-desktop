@@ -190,6 +190,21 @@
     </method>
 
     <!--
+        RelayUdp:
+
+        The dst server asks the system server, which has the port, to carry
+        the RDP-UDP datagrams of the client whose SYN brings cookie_hash over
+        the datagram socket fd. The dst server has the other end of it.
+    -->
+    <method name="RelayUdp">
+      <annotation name="org.gtk.GDBus.C.UnixFD" value="true" />
+      <arg name="cookie_hash" direction="in" type="ay">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true" />
+      </arg>
+      <arg name="fd" direction="in" type="h" />
+    </method>
+
+    <!--
         GetSystemCredentials:
 
         Get the system credentials to be used instead of the one-time

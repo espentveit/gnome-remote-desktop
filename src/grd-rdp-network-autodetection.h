@@ -65,6 +65,9 @@ void grd_rdp_network_autodetection_set_rtt_consumer_necessity (GrdRdpNetworkAuto
                                                                GrdRdpNwAutodetectRTTConsumer   rtt_consumer,
                                                                GrdRdpNwAutodetectRTTNecessity  rtt_necessity);
 
+void grd_rdp_network_autodetection_set_tunnel_linked (GrdRdpNetworkAutodetection *network_autodetection,
+                                                      gboolean                    linked);
+
 gboolean grd_rdp_network_autodetection_try_bw_measure_start (GrdRdpNetworkAutodetection *network_autodetection);
 
 void grd_rdp_network_autodetection_bw_measure_stop (GrdRdpNetworkAutodetection *network_autodetection);

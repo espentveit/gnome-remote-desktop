@@ -29,3 +29,8 @@ G_DECLARE_FINAL_TYPE (GrdDaemonHandover, grd_daemon_handover,
                       GRD, DAEMON_HANDOVER, GrdDaemon)
 
 GrdDaemonHandover *grd_daemon_handover_new (GError **error);
+
+gboolean grd_daemon_handover_relay_udp (GrdDaemonHandover  *daemon_handover,
+                                        const uint8_t      *cookie_hash,
+                                        int                 fd,
+                                        GError            **error);

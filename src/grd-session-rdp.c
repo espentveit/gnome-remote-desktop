@@ -19,6 +19,11 @@
 
 #include "config.h"
 
+#ifdef HAVE_FREERDP_UDP
+#include <freerdp/server/udp.h>
+#include "grd-daemon-handover.h"
+#endif
+
 #include "grd-session-rdp.h"
 
 #include <freerdp/channels/drdynvc.h>
@@ -1423,6 +1428,87 @@ rdp_peer_context_new (freerdp_peer   *peer,
   return TRUE;
 }
 
+#ifdef HAVE_FREERDP_UDP
+/* The system daemon owns the port; client datagrams are passed to this process
+ * via a socket pair. */
+static BOOL
+on_offer_udp_tunnel (void       *custom,
+                     rdpUdpFlow *flow,
+                     const BYTE  cookie_hash[32])
+{
+  GrdDaemonHandover *daemon_handover =
+    GRD_DAEMON_HANDOVER (g_application_get_default ());
+  g_autoptr (GError) error = NULL;
+  gboolean relayed;
+  int fds[2];
+
+  if (!freerdp_udp_socket_pair (fds))
+    return FALSE;
+
+  if (!freerdp_udp_flow_set_socket (flow, fds[0]))
+    {
+      close (fds[0]);
+      close (fds[1]);
+      return FALSE;
+    }
+
+  relayed = grd_daemon_handover_relay_udp (daemon_handover, cookie_hash, fds[1],
+                                           &error);
+  close (fds[1]);
+  if (!relayed)
+    g_warning ("[RDP] No UDP tunnel, staying on TCP: %s", error->message);
+
+  return relayed;
+}
+
+static void
+on_udp_link_changed (void                 *custom,
+                     FreeRDP_UdpLinkState  state)
+{
+  GrdSessionRdp *session_rdp = custom;
+  RdpPeerContext *rdp_peer_context =
+    (RdpPeerContext *) session_rdp->peer->context;
+
+  if (!rdp_peer_context->network_autodetection)
+    return;
+
+  grd_rdp_network_autodetection_set_tunnel_linked (
+    rdp_peer_context->network_autodetection,
+    state == FREERDP_UDP_LINK_READY);
+}
+
+static void
+on_udp_write_unblocked (void *custom)
+{
+  GrdSessionRdp *session_rdp = custom;
+  RdpPeerContext *rdp_peer_context =
+    (RdpPeerContext *) session_rdp->peer->context;
+
+  g_mutex_lock (&rdp_peer_context->channel_mutex);
+  if (rdp_peer_context->graphics_pipeline)
+    {
+      grd_rdp_dvc_graphics_pipeline_notify_write_unblocked (
+        rdp_peer_context->graphics_pipeline);
+    }
+  g_mutex_unlock (&rdp_peer_context->channel_mutex);
+}
+
+static gboolean
+init_udp_callbacks (GrdSessionRdp *session_rdp)
+{
+  GrdContext *context = grd_session_get_context (GRD_SESSION (session_rdp));
+  FreeRDP_UdpPeerCallbacks callbacks = { .Size = sizeof (callbacks) };
+
+  callbacks.LinkChanged = on_udp_link_changed;
+  callbacks.WriteUnblocked = on_udp_write_unblocked;
+  if (grd_context_get_runtime_mode (context) == GRD_RUNTIME_MODE_HANDOVER)
+    callbacks.OfferTunnel = on_offer_udp_tunnel;
+
+  return freerdp_peer_set_udp_callbacks (session_rdp->peer, &callbacks,
+                                         session_rdp);
+}
+#endif
+
 static gboolean
 init_rdp_session (GrdSessionRdp  *session_rdp,
                   const char     *username,
@@ -1574,7 +1660,24 @@ init_rdp_session (GrdSessionRdp  *session_rdp,
   freerdp_settings_set_bool (rdp_settings, FreeRDP_RefreshRect, FALSE);
   freerdp_settings_set_bool (rdp_settings, FreeRDP_SupportMonitorLayoutPdu,
                              use_client_configs);
-  freerdp_settings_set_bool (rdp_settings, FreeRDP_SupportMultitransport, FALSE);
+  /* Use server-side RDP-UDP to provide a reliable tunnel and migrate dynamic
+   * channels to it using Soft-Sync. */
+  /* The system daemon only hands over clients; the tunnel belongs to the
+   * process that serves the client. */
+  if (grd_context_get_runtime_mode (context) != GRD_RUNTIME_MODE_SYSTEM)
+    {
+      freerdp_settings_set_bool (rdp_settings, FreeRDP_SupportMultitransport, TRUE);
+      freerdp_settings_set_uint32 (rdp_settings, FreeRDP_MultitransportFlags,
+                                   TRANSPORT_TYPE_UDP_FECR | SOFTSYNC_TCP_TO_UDP);
+    }
+  else
+    {
+      freerdp_settings_set_bool (rdp_settings, FreeRDP_SupportMultitransport, FALSE);
+    }
+#ifdef HAVE_FREERDP_UDP
+  if (!init_udp_callbacks (session_rdp))
+    g_warning ("[RDP] Failed to set the UDP callbacks");
+#endif
   freerdp_settings_set_uint32 (rdp_settings, FreeRDP_VCFlags, VCCAPS_COMPR_SC);
   freerdp_settings_set_uint32 (rdp_settings, FreeRDP_VCChunkSize, 16256);
 
@@ -1885,6 +1988,15 @@ grd_session_rdp_stop (GrdSession *session)
   g_clear_object (&rdp_peer_context->graphics_pipeline);
   g_clear_object (&rdp_peer_context->telemetry);
   g_mutex_unlock (&rdp_peer_context->channel_mutex);
+
+  /* The socket thread may be blocked reading from a client that is not sending data.
+   * Shutting down the read side forces the read to return, allowing the subsequent
+   * disconnect to proceed. */
+  if (session_rdp->connection)
+    {
+      g_socket_shutdown (g_socket_connection_get_socket (session_rdp->connection),
+                         TRUE, FALSE, NULL);
+    }
 
   g_clear_pointer (&session_rdp->socket_thread, g_thread_join);
   g_clear_handle_id (&session_rdp->notify_post_connected_source_id,

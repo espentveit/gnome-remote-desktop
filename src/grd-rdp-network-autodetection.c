@@ -19,6 +19,10 @@
 
 #include "config.h"
 
+#ifdef HAVE_FREERDP_UDP
+#include <freerdp/server/udp.h>
+#endif
+
 #include "grd-rdp-network-autodetection.h"
 
 #include "grd-rdp-connect-time-autodetection.h"
@@ -63,6 +67,7 @@ struct _GrdRdpNetworkAutodetection
   GObject parent;
 
   rdpAutoDetect *rdp_autodetect;
+  int tunnel_linked;
   GMutex shutdown_mutex;
   gboolean in_shutdown;
 
@@ -334,6 +339,21 @@ grd_rdp_network_autodetection_set_rtt_consumer_necessity (GrdRdpNetworkAutodetec
   g_mutex_unlock (&network_autodetection->consumer_mutex);
 }
 
+/* Bandwidth measurement must be performed on the transport currently used for graphics. */
+static RDP_TRANSPORT_TYPE
+get_bw_transport (GrdRdpNetworkAutodetection *network_autodetection)
+{
+  return g_atomic_int_get (&network_autodetection->tunnel_linked) ?
+         RDP_TRANSPORT_UDP_R : RDP_TRANSPORT_TCP;
+}
+
+void
+grd_rdp_network_autodetection_set_tunnel_linked (GrdRdpNetworkAutodetection *network_autodetection,
+                                                 gboolean                    linked)
+{
+  g_atomic_int_set (&network_autodetection->tunnel_linked, linked);
+}
+
 gboolean
 grd_rdp_network_autodetection_try_bw_measure_start (GrdRdpNetworkAutodetection *network_autodetection)
 {
@@ -347,7 +367,8 @@ grd_rdp_network_autodetection_try_bw_measure_start (GrdRdpNetworkAutodetection *
   network_autodetection->bw_measure_state = BW_MEASURE_STATE_PENDING_STOP;
   g_clear_pointer (&locker, g_mutex_locker_free);
 
-  rdp_autodetect->BandwidthMeasureStart (rdp_autodetect, RDP_TRANSPORT_TCP,
+  rdp_autodetect->BandwidthMeasureStart (rdp_autodetect,
+                                         get_bw_transport (network_autodetection),
                                          BW_MEASURE_SEQUENCE_NUMBER);
 
   return TRUE;
@@ -368,7 +389,8 @@ grd_rdp_network_autodetection_bw_measure_stop (GrdRdpNetworkAutodetection *netwo
   network_autodetection->bw_measure_state = BW_MEASURE_STATE_PENDING_RESULTS;
   g_clear_pointer (&locker, g_mutex_locker_free);
 
-  rdp_autodetect->BandwidthMeasureStop (rdp_autodetect, RDP_TRANSPORT_TCP,
+  rdp_autodetect->BandwidthMeasureStop (rdp_autodetect,
+                                        get_bw_transport (network_autodetection),
                                         BW_MEASURE_SEQUENCE_NUMBER, 0);
 }
 
@@ -507,7 +529,9 @@ autodetect_rtt_measure_response (rdpAutoDetect      *rdp_autodetect,
   int64_t avg_round_trip_time_us;
   gboolean has_rtt_consumer_rdpgfx = FALSE;
 
-  g_assert (transport_type == RDP_TRANSPORT_TCP);
+  /* Only process responses received via the TCP transport. */
+  if (transport_type != RDP_TRANSPORT_TCP)
+    return TRUE;
 
   pong_time_us = g_get_monotonic_time ();
 
@@ -558,6 +582,21 @@ autodetect_rtt_measure_response (rdpAutoDetect      *rdp_autodetect,
   if (!network_autodetection->in_shutdown && has_rtt_consumer_rdpgfx &&
       rdp_peer_context->graphics_pipeline)
     {
+#ifdef HAVE_FREERDP_UDP
+      /* Pings remain on TCP, which is idle once graphics move to the tunnel;
+       * only the tunnel knows the current queuing state. */
+      if (g_atomic_int_get (&network_autodetection->tunnel_linked))
+        {
+          FreeRDP_UdpSendState send_state = { .size = sizeof (send_state) };
+
+          if (freerdp_peer_get_udp_send_state (rdp_autodetect->context->peer,
+                                               &send_state))
+            {
+              avg_round_trip_time_us = MAX (avg_round_trip_time_us,
+                                            send_state.rttMs * 1000ll);
+            }
+        }
+#endif
       grd_rdp_dvc_graphics_pipeline_notify_new_round_trip_time (
         rdp_peer_context->graphics_pipeline, avg_round_trip_time_us);
     }
@@ -581,7 +620,9 @@ handle_bw_measure_results_connect_time (GrdRdpNetworkAutodetection *network_auto
   uint64_t bit_count;
   uint32_t bandwidth_kbits;
 
-  g_assert (transport_type == RDP_TRANSPORT_TCP);
+  /* The transport type is provided by the client. */
+  if (transport_type != RDP_TRANSPORT_TCP)
+    return TRUE;
 
   if (!grd_rdp_connect_time_autodetection_notify_bw_measure_results (ct_autodetection,
                                                                      time_delta_ms,

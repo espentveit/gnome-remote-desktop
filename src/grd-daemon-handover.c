@@ -66,6 +66,38 @@ on_remote_desktop_rdp_dispatcher_handover_requested (GObject      *object,
                                                      GAsyncResult *result,
                                                      gpointer      user_data);
 
+/* Blocks until the system daemon has established the relay. The client may send its SYN
+ * as soon as the offer is sent. */
+gboolean
+grd_daemon_handover_relay_udp (GrdDaemonHandover  *daemon_handover,
+                               const uint8_t      *cookie_hash,
+                               int                 fd,
+                               GError            **error)
+{
+  g_autoptr (GUnixFDList) fd_list = NULL;
+  GVariant *hash_variant;
+  int fd_idx;
+
+  if (!daemon_handover->remote_desktop_handover)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_CONNECTED,
+                   "No handover interface");
+      return FALSE;
+    }
+
+  fd_list = g_unix_fd_list_new ();
+  fd_idx = g_unix_fd_list_append (fd_list, fd, error);
+  if (fd_idx == -1)
+    return FALSE;
+
+  hash_variant = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, cookie_hash, 32,
+                                            sizeof (uint8_t));
+
+  return grd_dbus_remote_desktop_rdp_handover_call_relay_udp_sync (
+           daemon_handover->remote_desktop_handover, hash_variant,
+           g_variant_new_handle (fd_idx), fd_list, NULL, NULL, error);
+}
+
 static gboolean
 grd_daemon_handover_is_ready (GrdDaemon *daemon)
 {

@@ -63,6 +63,8 @@ if have_rdp
   polkit_dep = dependency('polkit-gobject-1', version: polkit_req)
   vulkan_dep = dependency('vulkan', version: vulkan_req)
   winpr_dep = dependency('winpr3', version: freerdp_req)
+  have_freerdp_udp = cc.has_header_symbol('freerdp/config.h', 'WITH_RDPEUDP_SERVER',
+                                           dependencies: [freerdp_dep, winpr_dep])
 
   glslc = find_program('glslc', required: true)
   spirv_opt = find_program('spirv-opt', required: true)
@@ -100,6 +102,9 @@ grd_username = get_option('user')
 grd_homedir = get_option('home_dir')
 
 cdata = configuration_data()
+if get_option('rdp') and have_freerdp_udp
+  cdata.set('HAVE_FREERDP_UDP', 1)
+endif
 cdata.set_quoted('GETTEXT_PACKAGE', 'gnome-remote-desktop')
 cdata.set_quoted('VERSION', meson.project_version())
 
